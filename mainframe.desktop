@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Mainframe
+GenericName=Wi-Fi Deauth
+Comment=Kick devices off Wi-Fi networks you own
+Exec=mainframe-launch
+Icon=mainframe
+Terminal=false
+Categories=Network;Security;System;
+Keywords=wifi;deauth;aircrack;security;pentest;
+StartupNotify=false

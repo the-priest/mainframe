@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#0d1410"/>
+      <stop offset="100%" stop-color="#050805"/>
+    </linearGradient>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="2.5" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <pattern id="scan" width="4" height="4" patternUnits="userSpaceOnUse">
+      <rect width="4" height="1" fill="#00ff8810"/>
+    </pattern>
+  </defs>
+
+  <!-- background -->
+  <rect width="256" height="256" rx="52" fill="url(#bg)"/>
+  <rect width="256" height="256" rx="52" fill="url(#scan)"/>
+
+  <!-- subtle inner border -->
+  <rect x="18" y="18" width="220" height="220" rx="40"
+        fill="none" stroke="#00ff88" stroke-width="1.5" opacity="0.25"/>
+
+  <!-- corner brackets -->
+  <g stroke="#00ff88" stroke-width="3" fill="none" stroke-linecap="round" opacity="0.7">
+    <path d="M 36 56 L 36 36 L 56 36"/>
+    <path d="M 200 36 L 220 36 L 220 56"/>
+    <path d="M 220 200 L 220 220 L 200 220"/>
+    <path d="M 56 220 L 36 220 L 36 200"/>
+  </g>
+
+  <!-- wifi arcs -->
+  <g stroke="#00ff88" fill="none" stroke-linecap="round" filter="url(#glow)">
+    <path d="M 72 80 Q 128 38 184 80" stroke-width="7" opacity="0.35"/>
+    <path d="M 90 100 Q 128 72 166 100" stroke-width="7" opacity="0.6"/>
+    <path d="M 108 120 Q 128 104 148 120" stroke-width="7" opacity="0.9"/>
+  </g>
+  <circle cx="128" cy="135" r="6" fill="#00ff88" filter="url(#glow)"/>
+
+  <!-- MF monogram -->
+  <text x="128" y="210"
+        font-family="ui-monospace, 'JetBrains Mono', 'Fira Code', monospace"
+        font-size="74" font-weight="800"
+        fill="#00ff88" text-anchor="middle"
+        letter-spacing="-3"
+        filter="url(#glow)">MF</text>
+</svg>

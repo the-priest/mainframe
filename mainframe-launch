@@ -1,0 +1,34 @@
+#!/bin/sh
+# mainframe-launch — open mainframe in whatever terminal exists, as root
+
+SUDO=""
+if [ "$(id -u)" -ne 0 ]; then
+  SUDO="sudo"
+fi
+
+CMD="$SUDO /usr/local/bin/mainframe"
+
+for term in xfce4-terminal konsole gnome-terminal tilix lxterminal mate-terminal terminator alacritty kitty xterm; do
+  if command -v "$term" >/dev/null 2>&1; then
+    case "$term" in
+      gnome-terminal)
+        exec "$term" --title="Mainframe" -- sh -c "$CMD; echo; read -p 'press enter to close...'"
+        ;;
+      tilix)
+        exec "$term" -t "Mainframe" -e "sh -c '$CMD; echo; read -p \"press enter to close...\"'"
+        ;;
+      konsole)
+        exec "$term" --title "Mainframe" -e sh -c "$CMD; echo; read -p 'press enter to close...'"
+        ;;
+      alacritty|kitty)
+        exec "$term" -e sh -c "$CMD; echo; read -p 'press enter to close...'"
+        ;;
+      *)
+        exec "$term" -T "Mainframe" -e sh -c "$CMD; echo; read -p 'press enter to close...'"
+        ;;
+    esac
+  fi
+done
+
+echo "no terminal emulator found." >&2
+exit 1
