@@ -49,24 +49,28 @@ need_root() {
 install_debian() {
   echo -e "${C}>> apt: installing deps${X}"
   apt update -qq
-  apt install -y python3 aircrack-ng wireless-tools iw net-tools procps
+  apt install -y python3 aircrack-ng wireless-tools iw iproute2 \
+                 network-manager ieee-data policykit-1 procps
 }
 
 install_arch() {
   echo -e "${C}>> pacman: installing deps${X}"
-  pacman -Sy --noconfirm --needed python aircrack-ng wireless_tools iw net-tools
+  pacman -Sy --noconfirm --needed python aircrack-ng wireless_tools iw iproute2 \
+                                   networkmanager polkit
+  # ieee-data may not be in default repos
+  echo -e "${D}note: install ieee-data manually for MAC vendor lookup${X}"
 }
 
 install_fedora() {
   echo -e "${C}>> dnf: installing deps${X}"
-  dnf install -y python3 aircrack-ng wireless-tools iw net-tools
+  dnf install -y python3 aircrack-ng wireless-tools iw iproute \
+                 NetworkManager polkit
 }
 
 install_termux() {
   echo -e "${Y}termux detected.${X}"
   echo -e "${D}termux cannot run monitor mode without root.${X}"
   echo -e "${D}for phone use, install kali nethunter chroot and run this from there.${X}"
-  echo -e "${D}installing python anyway so the script runs (read-only)...${X}"
   pkg install -y python aircrack-ng iw 2>/dev/null || true
 }
 
@@ -77,7 +81,6 @@ install_files() {
   install -m 755 mainframe.py     "${prefix}/bin/mainframe"
   install -m 755 mainframe-launch "${prefix}/bin/mainframe-launch"
 
-  # desktop entry + icon (skip if no X/wayland session paths)
   if [ -d /usr/share/applications ]; then
     install -m 644 mainframe.desktop /usr/share/applications/mainframe.desktop
   fi
@@ -96,7 +99,6 @@ echo -e "${C}detected:${X} ${G}${ENV}${X}\n"
 case "$ENV" in
   termux)
     install_termux
-    # termux user install — no desktop file, just binary
     install -m 755 mainframe.py     "$PREFIX/bin/mainframe"
     install -m 755 mainframe-launch "$PREFIX/bin/mainframe-launch"
     echo -e "\n${G}done.${X} run: ${C}mainframe${X}"
@@ -120,7 +122,7 @@ case "$ENV" in
     ;;
   *)
     echo -e "${R}unknown OS.${X} install manually:"
-    echo "  - python3, aircrack-ng, wireless-tools, iw"
+    echo "  - python3, aircrack-ng, wireless-tools, iw, network-manager, ieee-data"
     echo "  - copy mainframe.py to /usr/local/bin/mainframe"
     exit 1
     ;;
