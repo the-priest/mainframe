@@ -5,15 +5,13 @@ set -e
 G='\033[92m'; R='\033[91m'; Y='\033[93m'; C='\033[96m'; D='\033[2m'; X='\033[0m'
 
 banner() {
-  cat <<EOF
-${G}
+  printf "%b\n" "${G}
   __  __  ___ ___ _  _ ___ ___    _   __  __ ___
- |  \/  |/ _ \_ _| \| | __| _ \  /_\ |  \/  | __|
- | |\/| | (_) | || .\` | _||   / / _ \| |\/| | _|
- |_|  |_|\___/___|_|\_|_| |_|_\\_/_/ \_\_|  |_|___|
+ |  \\/  |/ _ \\_ _| \\| | __| _ \\  /_\\ |  \\/  | __|
+ | |\\/| | (_) | || .\` | _||   / / _ \\| |\\/| | _|
+ |_|  |_|\\___/___|_|\\_|_| |_|_\\_/_/ \\_\\_|  |_|___|
 ${X}${D} installer${X}
-
-EOF
+"
 }
 
 detect_env() {
@@ -49,8 +47,12 @@ need_root() {
 install_debian() {
   echo -e "${C}>> apt: installing deps${X}"
   apt update -qq
+  # polkit pieces moved around across releases; install whichever exist.
   apt install -y python3 aircrack-ng wireless-tools iw iproute2 \
-                 network-manager ieee-data policykit-1 procps
+                 network-manager ieee-data procps
+  apt install -y pkexec        2>/dev/null || true
+  apt install -y polkitd       2>/dev/null || true
+  apt install -y policykit-1   2>/dev/null || true
 }
 
 install_arch() {
