@@ -28,7 +28,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # ─── palette ──────────────────────────────────────────────────────────────────
 G = "\033[92m"; R = "\033[91m"; Y = "\033[93m"; C = "\033[96m"
@@ -210,6 +210,15 @@ def power_label(raw: str) -> str:
     return f"{p} dBm" if p is not None else "signal n/a"
 
 
+# 5 GHz channels that require DFS (radar avoidance). On most cards these are
+# not usable for injection in monitor mode without the radio having cleared
+# radar first — deauth will silently fail. Non-DFS 5 GHz is 36/40/44/48 (and,
+# outside the EU, 149–165). If a target sits on a DFS channel, move your own
+# router to 36–48 to test.
+DFS_CHANNELS = {52, 56, 60, 64, 100, 104, 108, 112, 116,
+                120, 124, 128, 132, 136, 140, 144}
+
+
 def band_of(channel: str) -> str:
     try:
         c = int(channel)
@@ -222,8 +231,15 @@ def band_of(channel: str) -> str:
     return "?"
 
 
+def is_dfs(channel: str) -> bool:
+    try:
+        return int(channel) in DFS_CHANNELS
+    except (TypeError, ValueError):
+        return False
+
+
 def band_color(band: str) -> str:
-    return {"2.4": G, "5": Y}.get(band, D)
+    return {"2.4": G, "5": C}.get(band, D)
 
 
 def prompt(text: str) -> str:
@@ -274,7 +290,7 @@ def discover_interfaces() -> list[Interface]:
 def select_interface(preselect: str | None, assume_yes: bool) -> Interface:
     interfaces = discover_interfaces()
     if not interfaces:
-        die("no wireless interfaces found. is the AR9271 plugged in?")
+        die("no wireless interfaces found. is your adapter plugged in?")
 
     if preselect:
         chosen = next((i for i in interfaces if i.name == preselect), None)
@@ -447,24 +463,25 @@ def _signal_key(raw: str) -> int:
     return -p if p is not None else 10_000
 
 
-def select_ap(aps: list[AccessPoint], show_all_bands: bool) -> AccessPoint | None:
+def select_ap(aps: list[AccessPoint], band_filter: str) -> AccessPoint | None:
+    aps = sorted(aps, key=lambda a: _signal_key(a.power))
+    if band_filter in ("2.4", "5"):
+        aps = [a for a in aps if a.band == band_filter]
+
     if not aps:
         print(f"{R}no access points found.{X} {D}try a longer scan: -s 30{X}")
+        if band_filter != "all":
+            print(f"{D}(scanning {band_filter} GHz only — drop --band to see everything){X}")
         return None
 
-    aps = sorted(aps, key=lambda a: _signal_key(a.power))
-    if not show_all_bands:
-        twofour = [a for a in aps if a.band == "2.4"]
-        if twofour:
-            aps = twofour
-
-    scope = "all bands" if show_all_bands else "2.4 GHz only — add --all-bands for 5 GHz"
+    scope = {"2.4": "2.4 GHz", "5": "5 GHz", "all": "all bands"}[band_filter]
     header(f"access points · {scope}")
     for idx, ap in enumerate(aps):
         bc = band_color(ap.band)
+        dfs = f"  {Y}DFS{X}" if is_dfs(ap.channel) else ""
         print(f"  {G}[{idx:>2}]{X} {B}{ap.essid[:32]}{X}")
         print(f"       {D}{ap.bssid}{X}  ch {ap.channel:>3}  "
-              f"{bc}{ap.band:>3} GHz{X}  {bars(ap.power)} {D}{power_label(ap.power)}{X}")
+              f"{bc}{ap.band:>3} GHz{X}{dfs}  {bars(ap.power)} {D}{power_label(ap.power)}{X}")
 
     while True:
         sel = prompt("\ntarget AP (number, q to quit)> ").lower()
@@ -475,8 +492,10 @@ def select_ap(aps: list[AccessPoint], show_all_bands: bool) -> AccessPoint | Non
         except (ValueError, IndexError):
             print(f"{R}invalid selection{X}")
             continue
-        if ap.band == "5":
-            print(f"{Y}note:{X} this AP is on 5 GHz; the AR9271 cannot deauth there.")
+        if is_dfs(ap.channel):
+            print(f"{Y}note:{X} ch {ap.channel} is a DFS channel. Most cards refuse "
+                  f"injection here in monitor mode, so the deauth may not land.")
+            print(f"{D}if it fails, move your router to channel 36–48 and rescan.{X}")
             if prompt("continue anyway? [y/N] ").lower() != "y":
                 continue
         return ap
@@ -517,7 +536,8 @@ def select_client(clients: list[Client], ap: AccessPoint):
 def confirm(ap: AccessPoint, client_mac: str | None, minutes: int) -> bool:
     header("confirm")
     print(f"  AP        : {B}{ap.essid}{X}  {D}{ap.bssid}{X}")
-    print(f"  channel   : {ap.channel}  ({ap.band} GHz)")
+    dfs = f"  {Y}· DFS (injection may not work){X}" if is_dfs(ap.channel) else ""
+    print(f"  channel   : {ap.channel}  ({ap.band} GHz){dfs}")
     if client_mac:
         v = vendor(client_mac)
         print(f"  target    : {B}{client_mac}{X}" + (f"  {C}{v}{X}" if v else ""))
@@ -530,6 +550,9 @@ def confirm(ap: AccessPoint, client_mac: str | None, minutes: int) -> bool:
 def deauth(mon: str, ap: AccessPoint, client_mac: str | None, minutes: int) -> None:
     if not set_channel(mon, ap.channel):
         print(f"{Y}warning: couldn't lock channel {ap.channel}; continuing anyway{X}")
+        if is_dfs(ap.channel):
+            print(f"{D}  ch {ap.channel} is DFS — the card likely won't TX here. "
+                  f"move the router to 36–48 and retry.{X}")
 
     cmd = ["aireplay-ng", "--deauth", "0", "--ignore-negative-one", "-a", ap.bssid]
     if client_mac:
@@ -578,8 +601,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="focused client scan duration, seconds (default 30)")
     p.add_argument("-t", "--time", type=int, default=10,
                    help="deauth duration, minutes (default 10)")
-    p.add_argument("--all-bands", action="store_true",
-                   help="also scan/show 5 GHz (needs a 5 GHz-capable adapter)")
+    p.add_argument("-b", "--band", choices=["2.4", "5", "all"], default="all",
+                   help="band to scan: 2.4, 5, or all (default all)")
     p.add_argument("-y", "--yes", action="store_true",
                    help="skip the authorisation acknowledgement prompt")
     p.add_argument("-l", "--list", action="store_true",
@@ -635,10 +658,10 @@ def main() -> None:
     try:
         mon = enter_monitor(iface, session)
 
-        bands = "abg" if args.all_bands else "bg"
-        aps, _ = scan(mon, args.scan_time, bands=bands,
+        airo_band = {"2.4": "bg", "5": "a", "all": "abg"}[args.band]
+        aps, _ = scan(mon, args.scan_time, bands=airo_band,
                       label="scanning for access points")
-        ap = select_ap(aps, args.all_bands)
+        ap = select_ap(aps, args.band)
         if ap is None:
             return
 

@@ -5,9 +5,10 @@ Built for Kali, works on Debian / Ubuntu / Arch / Fedora / NetHunter chroot.
 
 ## Hardware reality
 
-- AR9271 is **2.4 GHz only**. If your target is connected via 5 GHz, this can't reach them.
-- Dual-band routers usually broadcast both bands on the same SSID. Phones pick based on signal — often 5 GHz when close, dropping to 2.4 GHz farther away.
-- For full coverage you need a dual-band injector adapter (e.g. Alfa AWUS036ACM, mt7612u chipset).
+- Scans and deauths **both 2.4 and 5 GHz** with a dual-band injector adapter (e.g. Alfa AWUS036ACM, mt7612u chipset). Defaults to scanning all bands.
+- Single-band cards still work — they just won't see the other band. The AR9271 is 2.4 GHz only; pass `-b 2.4` with it to skip the pointless 5 GHz channel hops.
+- **DFS channels (52–144)** are the catch on 5 GHz. Most cards refuse injection on these in monitor mode because they require radar detection first, so a deauth there will silently fail even though the AP shows up in the scan. Non-DFS 5 GHz is **36/40/44/48** (and, outside the EU, 149–165). If your target is on a DFS channel, move your own router to 36–48 to test. The picker flags DFS channels with a yellow `DFS` tag.
+- Dual-band routers usually broadcast both bands on the same SSID. Phones pick based on signal — often 5 GHz when close, dropping to 2.4 GHz farther away. The same SSID can therefore show up twice in the scan, once per band.
 - On mobile, only NetHunter chroot can run this (Termux without root cannot do monitor mode). External USB-OTG adapter required.
 
 ## Install
@@ -32,8 +33,12 @@ sudo mainframe
 
 Flags:
 
+- `-b {2.4,5,all}` — band to scan (default `all`)
 - `-t MIN` — deauth duration in minutes (default 10)
-- `-s SEC` — AP scan duration in seconds (default 15)
+- `-s SEC` — AP scan duration in seconds (default 20)
+- `-c SEC` — focused client scan duration in seconds (default 30)
+
+Scanning all bands hops a lot more channels, so each gets less dwell time — if a known AP doesn't surface, bump `-s 30` or narrow with `-b 5`.
 
 Flow: pick wireless interface → monitor mode on → scan APs → pick AP → pick client MAC (or `a` for broadcast) → deauth → cleanup + back online.
 
@@ -41,10 +46,12 @@ Flow: pick wireless interface → monitor mode on → scan APs → pick AP → p
 
 Channel column tells you the band:
 
-- **1–14** — 2.4 GHz (AR9271 can hit these)
-- **36+**  — 5 GHz (needs a dual-band adapter; AR9271 won't even *see* these)
+- **1–14** — 2.4 GHz
+- **36–48** — 5 GHz, non-DFS — deauth works here
+- **52–144** — 5 GHz, **DFS** — flagged `DFS`; injection usually fails in monitor mode
+- **149–165** — 5 GHz, non-DFS (not allocated in the EU)
 
-If your home SSID doesn't appear in the scan and you know it's broadcasting, it's probably 5 GHz only at the moment, or you're out of range.
+If your home SSID doesn't appear and you know it's broadcasting, it's likely on a band you didn't scan, or the scan was too short to hop to its channel (try `-s 30`), or you're out of range.
 
 ## Uninstall
 
