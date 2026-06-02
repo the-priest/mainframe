@@ -13,17 +13,24 @@ Built for Kali, works on Debian / Ubuntu / Arch / Fedora / NetHunter chroot.
 
 ## Install
 
+One line:
+
 ```
-git clone git@github.com:the-priest/mainframe.git
-cd mainframe
-sudo bash install.sh
+curl -fsSL https://raw.githubusercontent.com/the-priest/mainframe/main/get.sh | sudo bash
 ```
 
-The installer detects your OS and installs `aircrack-ng`, `wireless-tools`, `iw`,
-plus the desktop entry and icon. After install you can either:
+Pulls the repo, detects your OS, installs `aircrack-ng` / `wireless-tools` / `iw` /
+`network-manager`, drops the binary in `/usr/local/bin`, registers the icon and
+desktop entry. Then either:
 
 - run `sudo mainframe` from a terminal, or
 - launch **Mainframe** from your app menu.
+
+Manual, from a local clone:
+
+```
+git clone https://github.com/the-priest/mainframe.git && cd mainframe && sudo bash install.sh
+```
 
 ## Usage
 
